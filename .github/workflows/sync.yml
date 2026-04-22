@@ -1,0 +1,39 @@
+name: TrainingPeaks → Google Calendar sync
+
+on:
+  schedule:
+    # Every 4 hours. GitHub cron is UTC; adjust if you want tighter.
+    - cron: "0 */4 * * *"
+  workflow_dispatch:  # manual "Run workflow" button
+
+concurrency:
+  group: tp-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run sync
+        env:
+          TP_USERNAME: ${{ secrets.TP_USERNAME }}
+          TP_PASSWORD: ${{ secrets.TP_PASSWORD }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_CALENDAR_ID: ${{ vars.GOOGLE_CALENDAR_ID || 'primary' }}
+          TIMEZONE: ${{ vars.TIMEZONE || 'Europe/Warsaw' }}
+          SYNC_DAYS: ${{ vars.SYNC_DAYS || '14' }}
+        run: python sync.py

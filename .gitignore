@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.log
+# Local credentials — NEVER commit
+google_credentials.json
+google_token.json
+client_secret*.json

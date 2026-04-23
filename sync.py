@@ -25,6 +25,7 @@ import datetime as dt
 import json
 import logging
 import os
+import pathlib
 import sys
 from typing import Any
 
@@ -46,6 +47,7 @@ TIMEZONE = os.environ.get("TIMEZONE", "Europe/Warsaw")
 SYNC_DAYS = int(os.environ.get("SYNC_DAYS", "14"))
 SYNC_PAST_DAYS = int(os.environ.get("SYNC_PAST_DAYS", "1"))
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+DEBUG_DIR = pathlib.Path(os.environ.get("DEBUG_DIR", "debug"))
 
 TP_API_BASE = "https://tpapi.trainingpeaks.com"
 LOGIN_URL = "https://home.trainingpeaks.com/login"
@@ -74,6 +76,17 @@ log = logging.getLogger("tp-sync")
 
 # ---------------------------------------------------------------------------
 # TrainingPeaks
+
+
+async def _snap(page, name: str) -> None:
+    """Save a screenshot for debugging. Cheap and only used on failure paths."""
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        path = DEBUG_DIR / f"{name}.png"
+        await page.screenshot(path=str(path), full_page=True)
+        log.info("Saved screenshot: %s", path)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not save screenshot %s: %s", name, e)
 
 
 async def tp_get_auth_cookie() -> str:
@@ -116,28 +129,71 @@ async def tp_get_auth_cookie() -> str:
             await page.fill("#Password", TP_PASSWORD)
             await page.click("#btnSubmit")
 
-            # After successful login TP redirects to app.trainingpeaks.com.
-            # If credentials are bad, it stays on /login with an error message.
+            # Wait for any navigation off /login. TP may redirect through
+            # several pages (home, dashboard, app) — we don't care which,
+            # just that we left the login page.
             try:
-                await page.wait_for_url("**app.trainingpeaks.com/**", timeout=20_000)
+                await page.wait_for_function(
+                    "!window.location.pathname.toLowerCase().includes('/login')",
+                    timeout=30_000,
+                )
             except Exception:
+                # Still on /login — almost certainly a bad credential or
+                # captcha rejection. Capture the page for debugging.
+                await _snap(page, "login-stuck")
                 body = await page.content()
-                if "Invalid username or password" in body or "Login" in (
-                    await page.title()
+                lowered = body.lower()
+                if any(
+                    msg in lowered
+                    for msg in (
+                        "invalid username or password",
+                        "incorrect username",
+                        "incorrect password",
+                    )
                 ):
                     raise RuntimeError(
-                        "TrainingPeaks login failed — check TP_USERNAME / TP_PASSWORD."
+                        "TrainingPeaks login failed — wrong TP_USERNAME / TP_PASSWORD."
                     )
-                raise
+                raise RuntimeError(
+                    f"Login submit didn't navigate away from /login. "
+                    f"URL: {page.url}. See debug/login-stuck.png."
+                )
 
-            cookies = await context.cookies()
+            log.info("Login submitted, current URL: %s", page.url)
+
+            # The Production_tpAuth cookie is set by tpapi.trainingpeaks.com,
+            # which the app loads via XHR. Force-visit the app domain to
+            # ensure that XHR fires and the cookie lands in our jar.
+            try:
+                await page.goto(
+                    "https://app.trainingpeaks.com/", wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+            except Exception as e:
+                log.warning("Could not load app.trainingpeaks.com (%s); will still poll for cookie.", e)
+
+            # Poll the cookie jar for up to 30s.
+            auth_cookie_value: str | None = None
+            for _ in range(60):
+                cookies = await context.cookies()
+                for c in cookies:
+                    if c["name"] == "Production_tpAuth":
+                        auth_cookie_value = c["value"]
+                        break
+                if auth_cookie_value:
+                    break
+                await asyncio.sleep(0.5)
+
+            if not auth_cookie_value:
+                await _snap(page, "no-auth-cookie")
+                raise RuntimeError(
+                    f"Logged in but Production_tpAuth cookie never appeared. "
+                    f"Final URL: {page.url}. See debug/no-auth-cookie.png."
+                )
         finally:
             await browser.close()
 
-    for c in cookies:
-        if c["name"] == "Production_tpAuth":
-            return c["value"]
-    raise RuntimeError("Login succeeded but Production_tpAuth cookie not found.")
+    return auth_cookie_value
 
 
 async def tp_exchange_cookie_for_token(cookie: str) -> str:

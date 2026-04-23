@@ -91,6 +91,20 @@ async def tp_get_auth_cookie() -> str:
             page = await context.new_page()
             await page.goto(LOGIN_URL, wait_until="networkidle")
 
+            # Dismiss OneTrust cookie consent banner — its overlay
+            # (`onetrust-pc-dark-filter`) intercepts clicks on the login button.
+            try:
+                await page.click("#onetrust-accept-btn-handler", timeout=5_000)
+            except Exception:
+                pass
+            # Belt-and-braces: nuke the consent SDK from the DOM in case the
+            # accept button changed name or the banner re-renders.
+            await page.evaluate(
+                "document.getElementById('onetrust-consent-sdk')?.remove();"
+                "document.querySelectorAll('.onetrust-pc-dark-filter')"
+                ".forEach(el => el.remove());"
+            )
+
             # Wait for reCAPTCHA v3 to populate the hidden token field.
             await page.wait_for_function(
                 "document.getElementById('captcha-token') "

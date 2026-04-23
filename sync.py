@@ -287,12 +287,17 @@ def _duration_minutes(w: dict[str, Any]) -> int:
         return 0
 
 
+# Bump when the event-rendering format changes so existing events get rewritten.
+EVENT_SCHEMA_VERSION = 2  # v2 = all-day events
+
+
 def _fingerprint(w: dict[str, Any]) -> str:
     """Stable hash of the fields we care about — lets us skip unchanged events."""
     import hashlib
 
     payload = json.dumps(
         {
+            "v": EVENT_SCHEMA_VERSION,
             "title": w.get("title") or "",
             "desc": w.get("description") or "",
             "coach": w.get("coachComments") or "",

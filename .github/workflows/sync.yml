@@ -2,8 +2,9 @@ name: TrainingPeaks → Google Calendar sync
 
 on:
   schedule:
-    # Every 4 hours. GitHub cron is UTC; adjust if you want tighter.
-    - cron: "0 */4 * * *"
+    # Every 30 minutes. Note: GitHub cron is best-effort and may be delayed
+    # by 10-15 min when their schedulers are under load.
+    - cron: "*/30 * * * *"
   workflow_dispatch:  # manual "Run workflow" button
 
 concurrency:

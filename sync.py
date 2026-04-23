@@ -43,7 +43,7 @@ TP_USERNAME = os.environ["TP_USERNAME"]
 TP_PASSWORD = os.environ["TP_PASSWORD"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
-TIMEZONE = os.environ.get("TIMEZONE", "Europe/Warsaw")
+TIMEZONE = os.environ.get("TIMEZONE", "Europe/Warsaw")  # kept for future use
 SYNC_DAYS = int(os.environ.get("SYNC_DAYS", "14"))
 SYNC_PAST_DAYS = int(os.environ.get("SYNC_PAST_DAYS", "1"))
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
@@ -275,28 +275,13 @@ def _parse_workout_day(raw: str | None) -> dt.date | None:
     return dt.date.fromisoformat(raw.split("T")[0])
 
 
-def _workout_start_time(w: dict[str, Any]) -> dt.time:
-    """Derive a start time. TP workouts don't carry a scheduled clock time;
-    we place planned workouts at 07:00 local by default."""
-    # If a start timestamp is present (completed workouts), honour it.
-    for key in ("startTime", "startTimePlanned"):
-        val = w.get(key)
-        if val and isinstance(val, str) and "T" in val:
-            try:
-                return dt.time.fromisoformat(val.split("T")[1][:8])
-            except ValueError:
-                pass
-    return dt.time(7, 0)
-
-
 def _duration_minutes(w: dict[str, Any]) -> int:
     """Planned duration in minutes. TP stores totalTimePlanned as hours (float)."""
     val = w.get("totalTimePlanned") or w.get("totalTime") or 0
     try:
-        minutes = int(round(float(val) * 60))
+        return int(round(float(val) * 60))
     except (TypeError, ValueError):
-        minutes = 0
-    return max(minutes, 30)  # minimum 30 min block for visibility
+        return 0
 
 
 def _fingerprint(w: dict[str, Any]) -> str:
@@ -320,15 +305,10 @@ def _fingerprint(w: dict[str, Any]) -> str:
 
 
 def workout_to_event(w: dict[str, Any]) -> dict[str, Any] | None:
-    """Transform a TP workout dict into a Google Calendar event body."""
+    """Transform a TP workout dict into an all-day Google Calendar event."""
     day = _parse_workout_day(w.get("workoutDay"))
     if not day:
         return None
-
-    start_time = _workout_start_time(w)
-    start_dt = dt.datetime.combine(day, start_time)
-    duration = _duration_minutes(w)
-    end_dt = start_dt + dt.timedelta(minutes=duration)
 
     sport_id = w.get("workoutTypeFamilyId")
     emoji = SPORT_EMOJI.get(sport_id, "🏅") if isinstance(sport_id, int) else "🏅"
@@ -341,8 +321,9 @@ def workout_to_event(w: dict[str, Any]) -> dict[str, Any] | None:
     if w.get("coachComments"):
         description_parts.append("Coach notes:\n" + str(w["coachComments"]).strip())
     stats = []
-    if w.get("totalTimePlanned"):
-        stats.append(f"Planned: {_duration_minutes(w)} min")
+    duration = _duration_minutes(w)
+    if duration:
+        stats.append(f"Planned: {duration} min")
     if w.get("distancePlanned"):
         stats.append(f"Distance: {w['distancePlanned']/1000:.1f} km")
     if w.get("tssPlanned"):
@@ -352,11 +333,13 @@ def workout_to_event(w: dict[str, Any]) -> dict[str, Any] | None:
     description_parts.append("— synced from TrainingPeaks")
     description = "\n\n".join(description_parts)
 
+    # All-day event: Google Calendar requires `end.date` to be the day AFTER
+    # the last day the event covers (exclusive end).
     return {
         "summary": summary,
         "description": description,
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
-        "end": {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE},
+        "start": {"date": day.isoformat()},
+        "end": {"date": (day + dt.timedelta(days=1)).isoformat()},
         "reminders": {"useDefault": True},
         "extendedProperties": {
             "private": {

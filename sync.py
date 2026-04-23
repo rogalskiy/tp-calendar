@@ -102,7 +102,10 @@ async def tp_get_auth_cookie() -> str:
                 )
             )
             page = await context.new_page()
-            await page.goto(LOGIN_URL, wait_until="networkidle")
+            # `networkidle` is too strict here — TP fires analytics XHRs
+            # continuously and the page never goes idle within timeout.
+            # `domcontentloaded` + the explicit reCAPTCHA wait below is enough.
+            await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45_000)
 
             # Dismiss OneTrust cookie consent banner — its overlay
             # (`onetrust-pc-dark-filter`) intercepts clicks on the login button.

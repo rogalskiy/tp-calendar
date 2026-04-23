@@ -243,28 +243,56 @@ async def tp_get_athlete_id(access_token: str) -> int:
 async def tp_fetch_workouts(
     access_token: str, athlete_id: int, start: dt.date, end: dt.date
 ) -> list[dict[str, Any]]:
-    """Fetch planned & completed workouts in [start, end] inclusive."""
+    """Fetch planned & completed workouts in [start, end] inclusive.
+
+    The list endpoint returns workout summaries WITHOUT the `structure`
+    field, so we follow up with parallel single-workout fetches to get
+    interval steps for each one.
+    """
     url = (
         f"{TP_API_BASE}/fitness/v6/athletes/{athlete_id}"
         f"/workouts/{start.isoformat()}/{end.isoformat()}"
     )
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(
-            url,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json",
-            },
-        )
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=30, headers=headers) as client:
+        r = await client.get(url)
         r.raise_for_status()
         data = r.json()
-    # API returns either a list or an object with a list; be defensive.
-    if isinstance(data, list):
-        return data
-    for key in ("workouts", "items", "data"):
-        if isinstance(data.get(key), list):
-            return data[key]
-    raise RuntimeError(f"Unexpected workouts response shape: {type(data).__name__}")
+
+        if isinstance(data, list):
+            workouts = data
+        else:
+            workouts = next(
+                (data[k] for k in ("workouts", "items", "data") if isinstance(data.get(k), list)),
+                None,
+            )
+            if workouts is None:
+                raise RuntimeError(
+                    f"Unexpected workouts response shape: {type(data).__name__}"
+                )
+
+        # Fetch full details (with `structure`) for each workout in parallel.
+        async def _fetch_detail(w: dict[str, Any]) -> dict[str, Any]:
+            wid = w.get("workoutId")
+            if not wid:
+                return w
+            try:
+                resp = await client.get(
+                    f"{TP_API_BASE}/fitness/v6/athletes/{athlete_id}/workouts/{wid}"
+                )
+                if resp.status_code == 200:
+                    detail = resp.json()
+                    if isinstance(detail, dict):
+                        # Merge — list summary + detail (detail wins on conflict).
+                        return {**w, **detail}
+            except Exception as e:  # noqa: BLE001
+                log.warning("Could not fetch detail for workout %s: %s", wid, e)
+            return w
+
+        return await asyncio.gather(*(_fetch_detail(w) for w in workouts))
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +316,118 @@ def _duration_minutes(w: dict[str, Any]) -> int:
 
 
 # Bump when the event-rendering format changes so existing events get rewritten.
-EVENT_SCHEMA_VERSION = 2  # v2 = all-day events
+EVENT_SCHEMA_VERSION = 3  # v3 = include structured workout steps in description
+
+# Pretty labels for TP's intensity classes.
+INTENSITY_LABELS = {
+    "warmUp": "Warm-up",
+    "active": "Work",
+    "rest": "Recovery",
+    "coolDown": "Cool-down",
+    "other": "Other",
+}
+
+# Short label for the primary intensity metric used in target ranges.
+METRIC_LABELS = {
+    "percentOfFtp": "% FTP",
+    "percentOfThresholdHr": "% LTHR",
+    "percentOfThresholdPace": "% threshold pace",
+}
+
+
+def _decode_structure(raw: Any) -> dict[str, Any] | None:
+    """TP sometimes returns `structure` as a JSON-encoded string. Normalise."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else None
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _format_step_length(length: dict[str, Any] | None) -> str:
+    if not isinstance(length, dict):
+        return ""
+    val = length.get("value")
+    unit = length.get("unit")
+    if not isinstance(val, (int, float)):
+        return ""
+    if unit == "second":
+        secs = int(val)
+        if secs >= 3600:
+            return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+        if secs >= 60:
+            return f"{secs // 60} min"
+        return f"{secs} s"
+    if unit == "meter":
+        return f"{val/1000:.1f} km" if val >= 1000 else f"{int(val)} m"
+    return f"{val} {unit}"
+
+
+def _format_targets(targets: list[dict[str, Any]] | None, metric_label: str) -> str:
+    if not isinstance(targets, list) or not targets:
+        return ""
+    primary = targets[0]
+    lo = primary.get("minValue")
+    hi = primary.get("maxValue")
+    if lo is None or hi is None:
+        return ""
+    if lo == hi:
+        return f"{int(lo)}{metric_label}"
+    return f"{int(lo)}-{int(hi)}{metric_label}"
+
+
+def _render_step(step: dict[str, Any], metric_label: str) -> str:
+    name = (step.get("name") or "").strip()
+    klass = INTENSITY_LABELS.get(step.get("intensityClass", ""), "")
+    length = _format_step_length(step.get("length"))
+    target = _format_targets(step.get("targets"), metric_label)
+
+    head = name or klass or "Step"
+    tail_parts = [p for p in (length, target) if p]
+    tail = " — " + " @ ".join(tail_parts) if tail_parts else ""
+    return f"{head}{tail}"
+
+
+def format_structure(structure: dict[str, Any] | None) -> str:
+    """Render TP workout structure as a human-readable bullet list."""
+    if not structure:
+        return ""
+    blocks = structure.get("structure")
+    if not isinstance(blocks, list) or not blocks:
+        return ""
+    metric = structure.get("primaryIntensityMetric", "")
+    metric_label = METRIC_LABELS.get(metric, "")
+
+    lines: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        length = block.get("length") or {}
+        reps = length.get("value", 1) if length.get("unit") == "repetition" else 1
+        steps = block.get("steps") or []
+        if not isinstance(steps, list) or not steps:
+            continue
+
+        # Single-step block: just render the step.
+        if reps == 1 and len(steps) == 1:
+            lines.append(f"• {_render_step(steps[0], metric_label)}")
+            continue
+
+        # Repeated block.
+        if len(steps) == 1:
+            lines.append(f"• {reps}× {_render_step(steps[0], metric_label)}")
+        else:
+            lines.append(f"• {reps}×")
+            for s in steps:
+                lines.append(f"    – {_render_step(s, metric_label)}")
+
+    return "\n".join(lines)
 
 
 def _fingerprint(w: dict[str, Any]) -> str:
@@ -306,6 +445,7 @@ def _fingerprint(w: dict[str, Any]) -> str:
             "sport": w.get("workoutTypeFamilyId"),
             "tss": w.get("tssPlanned"),
             "km": w.get("distancePlanned"),
+            "structure": format_structure(_decode_structure(w.get("structure"))),
         },
         sort_keys=True,
     )
@@ -328,6 +468,11 @@ def workout_to_event(w: dict[str, Any]) -> dict[str, Any] | None:
         description_parts.append(str(w["description"]).strip())
     if w.get("coachComments"):
         description_parts.append("Coach notes:\n" + str(w["coachComments"]).strip())
+
+    structure_text = format_structure(_decode_structure(w.get("structure")))
+    if structure_text:
+        description_parts.append("Steps:\n" + structure_text)
+
     stats = []
     duration = _duration_minutes(w)
     if duration:

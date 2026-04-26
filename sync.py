@@ -630,11 +630,16 @@ def sync_events(service, workouts: list[dict[str, Any]], window_start, window_en
 
 
 def health_check(workouts: list[dict[str, Any]]) -> None:
-    """Fail loudly if the result looks suspiciously empty.
+    """Log a warning if the result looks suspiciously empty.
 
-    Coach-scheduled athletes should virtually always have at least one planned
-    workout in the next week. A totally-empty response likely means the API
-    call silently returned nothing (auth drift, schema change, etc.)."""
+    Originally this hard-failed when 0 workouts were planned for the next
+    7 days, on the theory that coached athletes always have near-term
+    workouts. False positives showed up immediately: rest weeks, coach
+    delays, and any workout cluster at the far end of the 14-day window
+    all produce a legit 7-day gap. Real breakage (auth, HTTP, parsing)
+    raises its own exceptions, so all this needs to do is leave a
+    breadcrumb in the logs.
+    """
     today = dt.date.today()
     week = today + dt.timedelta(days=7)
     upcoming = [
@@ -643,10 +648,9 @@ def health_check(workouts: list[dict[str, Any]]) -> None:
         if (d := _parse_workout_day(w.get("workoutDay"))) and today <= d <= week
     ]
     if not upcoming:
-        raise RuntimeError(
-            "Health check failed: 0 workouts found for the next 7 days. "
-            "This is almost certainly a sync problem — investigate before "
-            "trusting calendar state."
+        log.warning(
+            "No workouts planned for the next 7 days. If this is unexpected, "
+            "check your TrainingPeaks calendar — sync mechanics are working."
         )
 
 

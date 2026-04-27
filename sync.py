@@ -316,7 +316,12 @@ def _duration_minutes(w: dict[str, Any]) -> int:
 
 
 # Bump when the event-rendering format changes so existing events get rewritten.
-EVENT_SCHEMA_VERSION = 3  # v3 = include structured workout steps in description
+EVENT_SCHEMA_VERSION = 4  # v4 = colored events (purple)
+
+# Google Calendar event colors are referenced by string IDs 1-11. "3" = Grape
+# (purple). Override via the EVENT_COLOR_ID env var if you want a different
+# colour without editing code. Set to empty string to use calendar default.
+EVENT_COLOR_ID = os.environ.get("EVENT_COLOR_ID", "3")
 
 # Pretty labels for TP's intensity classes.
 INTENSITY_LABELS = {
@@ -437,6 +442,7 @@ def _fingerprint(w: dict[str, Any]) -> str:
     payload = json.dumps(
         {
             "v": EVENT_SCHEMA_VERSION,
+            "color": EVENT_COLOR_ID,
             "title": w.get("title") or "",
             "desc": w.get("description") or "",
             "coach": w.get("coachComments") or "",
@@ -488,7 +494,7 @@ def workout_to_event(w: dict[str, Any]) -> dict[str, Any] | None:
 
     # All-day event: Google Calendar requires `end.date` to be the day AFTER
     # the last day the event covers (exclusive end).
-    return {
+    body: dict[str, Any] = {
         "summary": summary,
         "description": description,
         "start": {"date": day.isoformat()},
@@ -502,6 +508,9 @@ def workout_to_event(w: dict[str, Any]) -> dict[str, Any] | None:
             }
         },
     }
+    if EVENT_COLOR_ID:
+        body["colorId"] = EVENT_COLOR_ID
+    return body
 
 
 # ---------------------------------------------------------------------------

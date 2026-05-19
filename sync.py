@@ -316,7 +316,7 @@ def _duration_minutes(w: dict[str, Any]) -> int:
 
 
 # Bump when the event-rendering format changes so existing events get rewritten.
-EVENT_SCHEMA_VERSION = 4  # v4 = colored events (purple)
+EVENT_SCHEMA_VERSION = 5  # v5 = events marked "Free" (don't block meeting slots)
 
 # Google Calendar event colors are referenced by string IDs 1-11. "3" = Grape
 # (purple). Override via the EVENT_COLOR_ID env var if you want a different
@@ -499,6 +499,9 @@ def workout_to_event(w: dict[str, Any]) -> dict[str, Any] | None:
         "description": description,
         "start": {"date": day.isoformat()},
         "end": {"date": (day + dt.timedelta(days=1)).isoformat()},
+        # "transparent" = shows as Free, so these events don't block
+        # meeting-scheduling tools from offering your time slots.
+        "transparency": "transparent",
         "reminders": {"useDefault": True},
         "extendedProperties": {
             "private": {

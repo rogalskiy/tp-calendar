@@ -89,8 +89,8 @@ async def _snap(page, name: str) -> None:
         log.warning("Could not save screenshot %s: %s", name, e)
 
 
-async def tp_get_auth_cookie() -> str:
-    """Use Playwright to log in and return the Production_tpAuth cookie value."""
+async def _tp_login_once() -> str:
+    """One attempt: launch a browser, log in, return the auth cookie."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         try:
@@ -122,11 +122,21 @@ async def tp_get_auth_cookie() -> str:
             )
 
             # Wait for reCAPTCHA v3 to populate the hidden token field.
-            await page.wait_for_function(
-                "document.getElementById('captcha-token') "
-                "&& document.getElementById('captcha-token').value.length > 0",
-                timeout=20_000,
-            )
+            # reCAPTCHA v3 is score-based and sometimes withholds the token
+            # for headless browsers; bumped to 45s and we retry on the outer
+            # function. If still no token we submit anyway — TP's form sends
+            # `CaptchaHidden=true` and the server may accept it without a
+            # token, in which case we'll catch the failure on the next step.
+            try:
+                await page.wait_for_function(
+                    "document.getElementById('captcha-token') "
+                    "&& document.getElementById('captcha-token').value.length > 0",
+                    timeout=45_000,
+                )
+            except Exception:
+                log.warning(
+                    "reCAPTCHA v3 token not issued within 45s; submitting anyway."
+                )
 
             await page.fill("#Username", TP_USERNAME)
             await page.fill("#Password", TP_PASSWORD)
@@ -197,6 +207,32 @@ async def tp_get_auth_cookie() -> str:
             await browser.close()
 
     return auth_cookie_value
+
+
+async def tp_get_auth_cookie() -> str:
+    """Log in and return the Production_tpAuth cookie. Retries once on failure.
+
+    reCAPTCHA v3 occasionally withholds tokens or scores headless Chromium
+    low enough to be rejected; a fresh browser context usually clears it.
+    Credential errors are surfaced immediately without retry.
+    """
+    last_err: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            return await _tp_login_once()
+        except RuntimeError as e:
+            # Don't waste an attempt on bad credentials.
+            if "wrong TP_USERNAME" in str(e):
+                raise
+            log.warning("Login attempt %d failed: %s", attempt, e)
+            last_err = e
+        except Exception as e:  # Playwright/network errors
+            log.warning("Login attempt %d failed: %s", attempt, e)
+            last_err = e
+        if attempt == 1:
+            await asyncio.sleep(3)
+    assert last_err is not None
+    raise last_err
 
 
 async def tp_exchange_cookie_for_token(cookie: str) -> str:

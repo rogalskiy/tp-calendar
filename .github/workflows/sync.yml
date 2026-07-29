@@ -11,12 +11,29 @@ concurrency:
   group: tp-sync
   cancel-in-progress: false
 
+# actions:write is needed by the keepalive step to re-enable this workflow.
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
+      # GitHub disables scheduled workflows after 60 days without repo
+      # activity. Re-enabling the workflow via the API resets that timer,
+      # so this run keeps itself alive indefinitely.
+      - name: Keepalive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X PUT \
+            "repos/${{ github.repository }}/actions/workflows/sync.yml/enable" \
+          && echo "Workflow keepalive OK" \
+          || echo "Keepalive failed (non-fatal); sync continues"
 
       - uses: actions/setup-python@v5
         with:

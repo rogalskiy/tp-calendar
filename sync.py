@@ -350,6 +350,29 @@ async def tp_fetch_workouts(
                 w.get("title"),
                 w.get("workoutId"),
             )
+
+        # Diagnostic: dump calendar notes & other item types for the window.
+        # Strength sessions programmed outside the classic workout system
+        # (e.g. TP Strength) may live here rather than in /workouts.
+        for probe_name, probe_url in (
+            (
+                "calendarNote",
+                f"{TP_API_BASE}/fitness/v1/athletes/{athlete_id}"
+                f"/calendarNote/{start.isoformat()}/{end.isoformat()}",
+            ),
+            (
+                "events",
+                f"{TP_API_BASE}/fitness/v1/athletes/{athlete_id}"
+                f"/events/{start.isoformat()}/{end.isoformat()}",
+            ),
+        ):
+            try:
+                pr = await client.get(probe_url)
+                body = pr.json() if pr.status_code == 200 else pr.status_code
+                log.info("TP probe %s: %r", probe_name, body)
+            except Exception as e:  # noqa: BLE001
+                log.info("TP probe %s failed: %s", probe_name, e)
+
         return detailed
 
 

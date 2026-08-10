@@ -339,7 +339,18 @@ async def tp_fetch_workouts(
                 log.warning("Could not fetch detail for workout %s: %s", wid, e)
             return w
 
-        return await asyncio.gather(*(_fetch_detail(w) for w in workouts))
+        detailed = await asyncio.gather(*(_fetch_detail(w) for w in workouts))
+        # Diagnostic: log every workout TP returned so missing-item reports
+        # ("my strength workouts don't sync") can be traced to source data.
+        for w in detailed:
+            log.info(
+                "TP workout: day=%s typeValueId=%s title=%r id=%s",
+                (w.get("workoutDay") or "?")[:10],
+                w.get("workoutTypeValueId"),
+                w.get("title"),
+                w.get("workoutId"),
+            )
+        return detailed
 
 
 # ---------------------------------------------------------------------------

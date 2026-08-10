@@ -351,27 +351,47 @@ async def tp_fetch_workouts(
                 w.get("workoutId"),
             )
 
-        # Diagnostic: find the strength-platform list endpoint. Structured
-        # strength workouts live on api.peakswaresb.com (same Bearer token),
-        # not in the classic /fitness workouts API.
-        sb = "https://api.peakswaresb.com"
-        s, e_ = start.isoformat(), end.isoformat()
-        for probe_url in (
-            f"{sb}/rx/activity/v1/workouts?startDate={s}&endDate={e_}&calendarId={athlete_id}",
-            f"{sb}/rx/activity/v1/workouts?startDate={s}&endDate={e_}",
-            f"{sb}/rx/activity/v1/calendars/{athlete_id}/workouts?startDate={s}&endDate={e_}",
-            f"{sb}/rx/activity/v1/workouts/{s}/{e_}?calendarId={athlete_id}",
-            f"{sb}/rx/activity/v1/athletes/{athlete_id}/workouts/{s}/{e_}",
-            f"{sb}/rx/activity/v1/workouts/summaries?startDate={s}&endDate={e_}&calendarId={athlete_id}",
-        ):
-            try:
-                pr = await client.get(probe_url)
-                body = pr.text[:800] if pr.status_code == 200 else pr.status_code
-                log.info("SB probe %s -> %r", probe_url.replace(sb, ""), body)
-            except Exception as ex:  # noqa: BLE001
-                log.info("SB probe %s failed: %s", probe_url.replace(sb, ""), ex)
-
         return detailed
+
+
+STRENGTH_API_BASE = "https://api.peakswaresb.com"
+
+
+async def tp_fetch_strength_workouts(
+    access_token: str, athlete_id: int, start: dt.date, end: dt.date
+) -> list[dict[str, Any]]:
+    """Fetch structured strength (gym) workouts in [start, end] inclusive.
+
+    TrainingPeaks' strength builder lives on a separate platform
+    (api.peakswaresb.com, same Bearer token) and its workouts do NOT appear
+    in the classic /fitness workouts API. Endpoint shape discovered via the
+    trainingpeaks-mcp project. Returns a bare JSON array of summaries.
+    """
+    url = (
+        f"{STRENGTH_API_BASE}/rx/activity/v1/workouts/calendar"
+        f"/{athlete_id}/{start.isoformat()}/{end.isoformat()}"
+    )
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        # The strength API expects browser-like origin headers.
+        "Origin": "https://app.trainingpeaks.com",
+        "Referer": "https://app.trainingpeaks.com/",
+    }
+    async with httpx.AsyncClient(timeout=30, headers=headers) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+    items = data if isinstance(data, list) else (data.get("data") or [])
+    for sw in items:
+        log.info(
+            "TP strength workout: day=%s title=%r id=%s sets=%s",
+            sw.get("prescribedDate"),
+            sw.get("title"),
+            sw.get("id"),
+            sw.get("totalSets"),
+        )
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +629,80 @@ def workout_to_event(w: dict[str, Any]) -> dict[str, Any] | None:
     return body
 
 
+def strength_to_event(sw: dict[str, Any]) -> dict[str, Any] | None:
+    """Transform a TP Strength workout summary into an all-day grey event."""
+    day_raw = sw.get("prescribedDate") or ""
+    try:
+        day = dt.date.fromisoformat(str(day_raw)[:10])
+    except ValueError:
+        return None
+
+    title = (sw.get("title") or "Strength").strip()
+    summary = f"🏋️ {title}"
+
+    exercises = [
+        f"• {item.get('title')}"
+        for item in (sw.get("sequenceSummary") or [])
+        if isinstance(item, dict) and item.get("title")
+    ]
+
+    description_parts: list[str] = []
+    if sw.get("instructions"):
+        description_parts.append(str(sw["instructions"]).strip())
+    if exercises:
+        description_parts.append("Exercises:\n" + "\n".join(exercises))
+    stats = []
+    dur_s = sw.get("prescribedDurationInSeconds")
+    if isinstance(dur_s, (int, float)) and dur_s > 0:
+        stats.append(f"Planned: {int(round(dur_s / 60))} min")
+    if sw.get("totalSets"):
+        stats.append(f"Sets: {sw['totalSets']}")
+    if stats:
+        description_parts.append(" · ".join(stats))
+    description_parts.append("— synced from TrainingPeaks")
+    description = "\n\n".join(description_parts)
+
+    import hashlib
+
+    fingerprint = hashlib.sha1(
+        json.dumps(
+            {
+                "v": EVENT_SCHEMA_VERSION,
+                "color": SPORT_COLOR_OVERRIDES.get(9),
+                "title": title,
+                "day": day.isoformat(),
+                "dur": dur_s,
+                "sets": sw.get("totalSets"),
+                "ex": exercises,
+                "notes": sw.get("instructions") or "",
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()[:12]
+
+    body: dict[str, Any] = {
+        "summary": summary,
+        "description": description,
+        "start": {"date": day.isoformat()},
+        "end": {"date": (day + dt.timedelta(days=1)).isoformat()},
+        "transparency": "transparent",
+        "reminders": {"useDefault": True},
+        "extendedProperties": {
+            "private": {
+                EVENT_TAG_KEY: EVENT_TAG_VALUE,
+                # "sb" prefix keeps strength-platform ids from colliding with
+                # classic workout ids in the same tag namespace.
+                EVENT_WORKOUT_ID_KEY: f"sb{sw.get('id')}",
+                EVENT_FINGERPRINT_KEY: fingerprint,
+            }
+        },
+    }
+    color = SPORT_COLOR_OVERRIDES.get(9)
+    if color:
+        body["colorId"] = color
+    return body
+
+
 # ---------------------------------------------------------------------------
 # Google Calendar
 
@@ -658,19 +752,21 @@ def list_existing_events(service, window_start: dt.date, window_end: dt.date):
     return out
 
 
-def sync_events(service, workouts: list[dict[str, Any]], window_start, window_end):
+def sync_events(
+    service,
+    items: list[tuple[str, dict[str, Any]]],
+    window_start,
+    window_end,
+):
+    """Sync prebuilt (workout_id, event_body) pairs into the calendar."""
     existing = list_existing_events(service, window_start, window_end)
     log.info("Found %d existing synced events in calendar window.", len(existing))
 
     seen: set[str] = set()
     created = updated = deleted = unchanged = 0
 
-    for w in workouts:
-        wid = str(w.get("workoutId") or "")
-        if not wid:
-            continue
-        body = workout_to_event(w)
-        if body is None:
+    for wid, body in items:
+        if not wid or body is None:
             continue
         seen.add(wid)
 
@@ -783,11 +879,26 @@ async def main() -> int:
     workouts = await tp_fetch_workouts(token, athlete_id, window_start, window_end)
     log.info("Fetched %d workouts from TrainingPeaks.", len(workouts))
 
+    # Strength workouts live on TP's separate strength platform. A failure
+    # there shouldn't kill endurance sync — log loudly and continue.
+    try:
+        strength = await tp_fetch_strength_workouts(
+            token, athlete_id, window_start, window_end
+        )
+        log.info("Fetched %d strength workouts from TP Strength.", len(strength))
+    except Exception as e:  # noqa: BLE001
+        log.error("Strength fetch failed (continuing with endurance only): %s", e)
+        strength = []
+
     health_check(workouts)
+
+    items: list[tuple[str, dict[str, Any] | None]] = [
+        (str(w.get("workoutId") or ""), workout_to_event(w)) for w in workouts
+    ] + [(f"sb{sw.get('id')}", strength_to_event(sw)) for sw in strength]
 
     log.info("Syncing to Google Calendar (%s)...", GOOGLE_CALENDAR_ID)
     service = gcal_service()
-    sync_events(service, workouts, window_start, window_end)
+    sync_events(service, items, window_start, window_end)
 
     log.info("Done.")
     return 0

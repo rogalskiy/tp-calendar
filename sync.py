@@ -351,27 +351,25 @@ async def tp_fetch_workouts(
                 w.get("workoutId"),
             )
 
-        # Diagnostic: dump calendar notes & other item types for the window.
-        # Strength sessions programmed outside the classic workout system
-        # (e.g. TP Strength) may live here rather than in /workouts.
-        for probe_name, probe_url in (
-            (
-                "calendarNote",
-                f"{TP_API_BASE}/fitness/v1/athletes/{athlete_id}"
-                f"/calendarNote/{start.isoformat()}/{end.isoformat()}",
-            ),
-            (
-                "events",
-                f"{TP_API_BASE}/fitness/v1/athletes/{athlete_id}"
-                f"/events/{start.isoformat()}/{end.isoformat()}",
-            ),
+        # Diagnostic: find the strength-platform list endpoint. Structured
+        # strength workouts live on api.peakswaresb.com (same Bearer token),
+        # not in the classic /fitness workouts API.
+        sb = "https://api.peakswaresb.com"
+        s, e_ = start.isoformat(), end.isoformat()
+        for probe_url in (
+            f"{sb}/rx/activity/v1/workouts?startDate={s}&endDate={e_}&calendarId={athlete_id}",
+            f"{sb}/rx/activity/v1/workouts?startDate={s}&endDate={e_}",
+            f"{sb}/rx/activity/v1/calendars/{athlete_id}/workouts?startDate={s}&endDate={e_}",
+            f"{sb}/rx/activity/v1/workouts/{s}/{e_}?calendarId={athlete_id}",
+            f"{sb}/rx/activity/v1/athletes/{athlete_id}/workouts/{s}/{e_}",
+            f"{sb}/rx/activity/v1/workouts/summaries?startDate={s}&endDate={e_}&calendarId={athlete_id}",
         ):
             try:
                 pr = await client.get(probe_url)
-                body = pr.json() if pr.status_code == 200 else pr.status_code
-                log.info("TP probe %s: %r", probe_name, body)
-            except Exception as e:  # noqa: BLE001
-                log.info("TP probe %s failed: %s", probe_name, e)
+                body = pr.text[:800] if pr.status_code == 200 else pr.status_code
+                log.info("SB probe %s -> %r", probe_url.replace(sb, ""), body)
+            except Exception as ex:  # noqa: BLE001
+                log.info("SB probe %s failed: %s", probe_url.replace(sb, ""), ex)
 
         return detailed
 

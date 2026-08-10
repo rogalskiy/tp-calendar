@@ -58,13 +58,24 @@ EVENT_TAG_VALUE = "1"
 EVENT_WORKOUT_ID_KEY = "tp_workout_id"
 EVENT_FINGERPRINT_KEY = "tp_fingerprint"
 
-# Sport code → emoji (small nicety; coach titles are usually the main signal)
+# TP workoutTypeValueId → emoji. IDs per tp2intervals' TPTrainingTypeMapper:
+# 1=Swim 2=Bike 3=Run 4=Brick 5=Crosstrain 7=DayOff 8=MTB 9=Strength
+# 11=XC-Ski 12=Rowing 13=Walk 100=Other
 SPORT_EMOJI = {
     1: "🏊",  # Swim
     2: "🚴",  # Bike
     3: "🏃",  # Run
-    4: "🏋️",  # Strength
-    5: "🚴",  # MTB
+    8: "🚵",  # MTB
+    9: "🏋️",  # Strength
+    12: "🚣",  # Rowing
+    13: "🚶",  # Walk
+}
+
+# Per-sport event colour overrides (Google colorId). Strength → Graphite
+# (grey, id 8) so weight sessions are visually distinct from cycling
+# (global default EVENT_COLOR_ID, purple). Extend as needed.
+SPORT_COLOR_OVERRIDES = {
+    9: os.environ.get("EVENT_COLOR_ID_STRENGTH", "8"),
 }
 
 logging.basicConfig(
@@ -352,7 +363,7 @@ def _duration_minutes(w: dict[str, Any]) -> int:
 
 
 # Bump when the event-rendering format changes so existing events get rewritten.
-EVENT_SCHEMA_VERSION = 5  # v5 = events marked "Free" (don't block meeting slots)
+EVENT_SCHEMA_VERSION = 6  # v6 = per-sport colors (strength = grey) + typeValueId emoji
 
 # Google Calendar event colors are referenced by string IDs 1-11. "3" = Grape
 # (purple). Override via the EVENT_COLOR_ID env var if you want a different
@@ -471,6 +482,20 @@ def format_structure(structure: dict[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
+def _sport_id(w: dict[str, Any]) -> int | None:
+    """TP workout type id (workoutTypeValueId), e.g. 2=Bike, 9=Strength."""
+    val = w.get("workoutTypeValueId")
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _event_color(w: dict[str, Any]) -> str:
+    """Colour for this workout's event: per-sport override, else global."""
+    return SPORT_COLOR_OVERRIDES.get(_sport_id(w), EVENT_COLOR_ID)
+
+
 def _fingerprint(w: dict[str, Any]) -> str:
     """Stable hash of the fields we care about — lets us skip unchanged events."""
     import hashlib
@@ -478,13 +503,13 @@ def _fingerprint(w: dict[str, Any]) -> str:
     payload = json.dumps(
         {
             "v": EVENT_SCHEMA_VERSION,
-            "color": EVENT_COLOR_ID,
+            "color": _event_color(w),
             "title": w.get("title") or "",
             "desc": w.get("description") or "",
             "coach": w.get("coachComments") or "",
             "day": w.get("workoutDay"),
             "dur": w.get("totalTimePlanned"),
-            "sport": w.get("workoutTypeFamilyId"),
+            "sport": _sport_id(w),
             "tss": w.get("tssPlanned"),
             "km": w.get("distancePlanned"),
             "structure": format_structure(_decode_structure(w.get("structure"))),
@@ -500,8 +525,7 @@ def workout_to_event(w: dict[str, Any]) -> dict[str, Any] | None:
     if not day:
         return None
 
-    sport_id = w.get("workoutTypeFamilyId")
-    emoji = SPORT_EMOJI.get(sport_id, "🏅") if isinstance(sport_id, int) else "🏅"
+    emoji = SPORT_EMOJI.get(_sport_id(w), "🏅")
     title = (w.get("title") or "Workout").strip()
     summary = f"{emoji} {title}"
 
@@ -547,8 +571,9 @@ def workout_to_event(w: dict[str, Any]) -> dict[str, Any] | None:
             }
         },
     }
-    if EVENT_COLOR_ID:
-        body["colorId"] = EVENT_COLOR_ID
+    color = _event_color(w)
+    if color:
+        body["colorId"] = color
     return body
 
 
